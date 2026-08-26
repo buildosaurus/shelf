@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gates:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Tests
+        run: uv run --with pytest pytest test_shelf.py -q
+
+      - name: Lint
+        run: uv run --with ruff ruff check --select E,F,I,E501 shelf.py test_shelf.py
+
+      - name: Type check
+        run: >
+          uv run --with mypy --with pytest
+          mypy --check-untyped-defs shelf.py test_shelf.py
+
+      - name: Coverage
+        run: >
+          uv run --with pytest --with pytest-cov
+          pytest test_shelf.py --cov=script_under_test --cov-report=term-missing
+
+      - name: Smoke test the CLI
+        run: |
+          ./shelf.py --version
+          ./shelf.py config
