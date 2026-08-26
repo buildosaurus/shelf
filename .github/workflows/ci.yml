@@ -21,6 +21,10 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          # The floor declared in shelf.py's PEP 723 header. That header only
+          # governs `uv run --script`, so without this the pytest steps take
+          # whatever interpreter the runner image happens to ship.
+          python-version: "3.12"
 
       - name: Tests
         run: uv run --with pytest pytest test_shelf.py -q
