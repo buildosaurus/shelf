@@ -15,12 +15,20 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to a commit, not a tag: a tag is a pointer its owner can move,
+      # so trusting one trusts that account on every future run. The comment
+      # is what makes the diff readable and what Dependabot bumps.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
+          # Default globs hash uv.lock / requirements.txt / pyproject.toml -
+          # a single PEP 723 script has none, so nothing matched and the key
+          # never changed. The cached tools are declared in this file, so
+          # this file is the honest key.
+          cache-dependency-glob: .github/workflows/ci.yml
           # The floor declared in shelf.py's PEP 723 header. That header only
           # governs `uv run --script`, so without this the pytest steps take
           # whatever interpreter the runner image happens to ship.

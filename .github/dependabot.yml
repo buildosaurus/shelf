@@ -1,0 +1,13 @@
+# The other half of SHA-pinning the actions in workflows/ci.yml. A pin nobody
+# bumps is a frozen, unpatched action - worse than a floating tag for staying
+# current. Dependabot rewrites the SHA and the trailing "# vX.Y.Z" comment
+# together, which is what makes the scheme maintainable.
+#
+# Only github-actions: shelf declares no dependencies (PEP 723 header,
+# `dependencies = []`), so there is no Python ecosystem to watch.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
