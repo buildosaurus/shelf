@@ -1436,6 +1436,12 @@ def fleet_env(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "require_tools", lambda *a: None)
     monkeypatch.setattr(mod, "time_machine_excluded", lambda p: True)
     monkeypatch.setattr(mod, "detect_filesystem", lambda p: "apfs")
+    # Pin the platform too, or these tests assert macOS conventions (.command,
+    # [platform.macos]) against whatever OS happens to run them - green on a Mac,
+    # red on Linux CI. The filesystem stub above already assumes macOS; this says
+    # so out loud. Linux behaviour is covered by the build_platform tests, which
+    # name the platform instead of detecting it.
+    monkeypatch.setattr(mod, "detect_system", lambda: "darwin")
     return types.SimpleNamespace(
         base=tmp_path / "parc",
         volumes=volumes,
