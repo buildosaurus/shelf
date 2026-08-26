@@ -1,0 +1,31 @@
+# --- Your fleet: data, never code -------------------------------------------
+# A catalogue is a complete, named index of one of your disks. Publishing one
+# publishes every file name on it. These stay local, always.
+/shelf.toml
+/enclosures.toml
+/catalogs/
+/shortcuts/
+*.json.gz
+
+# --- Test and type-check artefacts ------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# --- Environments -----------------------------------------------------------
+.venv/
+venv/
+
+# --- OS noise ---------------------------------------------------------------
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
