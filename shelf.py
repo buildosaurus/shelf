@@ -624,6 +624,33 @@ def render_platform(platform: Platform, *, base: Path) -> str:
     )
 
 
+def ghost_identity(catalog: Catalog) -> dict[str, str]:
+    """What identifies the exact content a ghost was built from.
+
+    The timestamp alone is not enough: `scanned_at` has one-second resolution,
+    so two scans within the same second look identical. Entry count and total
+    size are content-derived and settle it.
+    """
+    return {
+        "label": catalog.label,
+        "scanned_at": catalog.scanned_at,
+        "entries": str(len(catalog.entries)),
+        "bytes": str(catalog.total_size),
+    }
+
+
+def ghost_is_current(marker: dict[str, str], catalog: Catalog) -> bool:
+    """Does an existing ghost already match this catalogue?
+
+    Compared on identity, not by walking the tree: rebuilding is cheap but not
+    free, and a fleet of ten disks is mostly unchanged on any given day.
+    """
+    if not marker:
+        return False
+    wanted = ghost_identity(catalog)
+    return all(marker.get(key) == value for key, value in wanted.items())
+
+
 def catalog_relpath(enclosure: str, label: str) -> Path:
     folder = enclosure or DEFAULT_ENCLOSURE
     return Path(CATALOGS_DIRNAME) / folder / f"{label}.json.gz"
@@ -942,6 +969,7 @@ def build_ghost(
                 "shelf_version": catalog.shelf_version,
                 "platform": catalog.platform,
                 "filesystem": catalog.filesystem,
+                **ghost_identity(catalog),
             },
             ensure_ascii=False,
             indent=2,
@@ -1094,6 +1122,15 @@ def find_catalogs(base: Path) -> list[Path]:
     return sorted(
         p for p in root.rglob("*.json*") if p.is_file() and not p.name.startswith(".")
     )
+
+
+def read_ghost_marker(dest: Path) -> dict[str, str]:
+    """THE single entry point to a ghost's marker. Absent or broken = empty."""
+    try:
+        raw = json.loads((dest / GHOST_MARKER).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
 
 
 def remove_ghost(dest: Path) -> None:
@@ -1739,7 +1776,63 @@ def cmd_tree(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ghost_all(args: argparse.Namespace) -> int:
+    """Rebuild every ghost in the fleet from the catalogues on this machine.
+
+    The point of the two-machine workflow: catalogues travel (kilobytes), the
+    ghosts are rebuilt locally (seconds). Nothing that carries a fake size is
+    ever transferred.
+    """
+    ctx = build_context(args)
+    paths = find_catalogs(ctx.base)
+    if not paths:
+        raise CatalogError(
+            f"no catalogue under {ctx.base / CATALOGS_DIRNAME} - run `shelf scan`"
+        )
+    root = ensure_ghost_root(ctx.platform)
+    rebuilt: list[str] = []
+    current: list[str] = []
+    failed: list[str] = []
+    for path in paths:
+        try:
+            catalog = read_catalog(path)
+            dest = root / catalog.label
+            if not args.force and ghost_is_current(read_ghost_marker(dest), catalog):
+                current.append(catalog.label)
+                log.info("%s already current", catalog.display)
+                continue
+            _make_ghost(catalog, root, empty=args.empty)
+            print(
+                f"  {catalog.display}: {human_int(len(catalog.files))} files, "
+                f"{human_size(catalog.total_size)} -> {dest}"
+            )
+            rebuilt.append(catalog.label)
+        except (CatalogError, GhostError, OSError) as exc:
+            # One unreadable catalogue must not stop the rest of the fleet.
+            failed.append(path.name)
+            log.error("%s: %s", path.name, exc)
+    print(
+        f"{human_int(len(rebuilt))} rebuilt, {human_int(len(current))} already "
+        f"current, {human_int(len(failed))} failed"
+    )
+    if failed:
+        print(f"  FAILED: {', '.join(failed)}")
+        return 1
+    return 0
+
+
 def cmd_ghost(args: argparse.Namespace) -> int:
+    if args.all:
+        if args.catalogue is not None or args.destination is not None:
+            raise QueryError(
+                "--all rebuilds the whole fleet: pass no catalogue and no "
+                "destination"
+            )
+        return cmd_ghost_all(args)
+    if args.catalogue is None:
+        raise QueryError(
+            "give a catalogue file, or --all to rebuild every ghost in the fleet"
+        )
     catalog = read_catalog(args.catalogue)
     if args.destination is not None:
         dest = args.destination.expanduser()
@@ -2137,10 +2230,22 @@ def build_parser() -> argparse.ArgumentParser:
         "ghost", add_help=False,
         help="Recreate the tree as empty files, usable by ls/find/Finder",
     )
-    ghost.add_argument("catalogue", type=Path, help="Catalogue file")
+    ghost.add_argument(
+        "catalogue", type=Path, nargs="?", default=None,
+        help="Catalogue file (omit it with --all)",
+    )
     ghost.add_argument(
         "destination", type=Path, nargs="?", default=None,
         help="Directory to rebuild the tree into (default <ghost-root>/<label>)",
+    )
+    ghost.add_argument(
+        "--all", action="store_true",
+        help="Rebuild every ghost in the fleet from the local catalogues, "
+             "skipping the ones already up to date",
+    )
+    ghost.add_argument(
+        "--force", action="store_true",
+        help="With --all, rebuild even the ghosts that are already current",
     )
     _add_ghost_options(ghost)
     _add_general(ghost)

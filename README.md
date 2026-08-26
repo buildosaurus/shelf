@@ -215,6 +215,7 @@ you which disk each hit lives on.
 | `shelf ls CATALOGUE [PATH]` | List a directory (`-l` for size and date) |
 | `shelf du CATALOGUE [PATH]` | What weighs the most (`--depth`, `--top`) |
 | `shelf tree CATALOGUE [PATH]` | Draw the tree (`--depth`) |
+| `shelf ghost --all` | Rebuild every ghost from the local catalogues |
 
 Filters: `--name`, `--path`, `--under`, `--type f|d`, `--min-size`,
 `--max-size`, `--newer`, `--older`, `--enclosure`, `--case-sensitive`. Sizes as
@@ -248,6 +249,30 @@ Ghost created: /Users/you/Volumes/Backup1
 
 A `.shelf-ghost.json` at the root records which disk it came from, when, from
 which machine, with which `shelf` version, and the source filesystem.
+
+### Two machines
+
+Ghosts are **local and disposable**; catalogues are what travel. Put the base in
+a synced folder and the catalogues arrive on their own — then rebuild every
+ghost on the other machine with one command:
+
+```console
+$ shelf ghost --all
+  Enclosure1/Backup1: 900 files, 1.6 TiB -> ~/Volumes/Backup1
+  Enclosure1/Backup2: 600 files, 1.1 TiB -> ~/Volumes/Backup2
+2 rebuilt, 0 already current, 0 failed
+```
+
+Measured: **2.7 TiB of ghosts rebuilt in 0.33 s** from 15.6 KiB of catalogues.
+Ghosts already matching their catalogue are skipped, so re-running it is free;
+`--force` rebuilds anyway.
+
+Each machine then holds a ghost of *every* disk in the fleet, including the ones
+that never get plugged into it.
+
+**Never transfer a ghost.** It holds no data, and a plain `rsync -a` materialises
+every zero: we measured 43 GB written in under two minutes before killing it.
+If you truly must move one, `cp` and `rsync -aS` both preserve sparseness.
 
 **Three traps worth knowing:**
 
@@ -403,10 +428,10 @@ path under that name, and `--cov=shelf` silently collects nothing.
 ```console
 $ uv run --with pytest --with pytest-cov pytest test_shelf.py \
     --cov=script_under_test --cov-report=term-missing
-shelf.py    1086    69    94%
+shelf.py    1135    69    94%
 ```
 
-**212 tests, 94% coverage.** The uncovered lines are mostly OS error branches
+**223 tests, 94% coverage.** The uncovered lines are mostly OS error branches
 that would need a broken filesystem to reach; they are not padded to chase a
 round number.
 

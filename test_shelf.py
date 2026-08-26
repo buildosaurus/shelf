@@ -14,6 +14,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import signal
 import sys
 import tomllib
@@ -78,11 +79,12 @@ def _entries(*items: object) -> dict[str, object]:
     return {mod.norm_key(e.rel): e for e in items}  # type: ignore[attr-defined]
 
 
-def _catalog(*items, root: str = "/Volumes/Disk", label: str = "Disk"):
+def _catalog(*items, root: str = "/Volumes/Disk", label: str = "Disk",
+             scanned_at: str = "2026-01-01 00:00:00"):
     return mod.Catalog(
         root=root,
         label=label,
-        scanned_at="2026-01-01 00:00:00",
+        scanned_at=scanned_at,
         entries={mod.norm_key(e.rel): e for e in items},
     )
 
@@ -1682,3 +1684,112 @@ def test_main_refuses_an_unsupported_platform(fleet_env, monkeypatch, capsys):
     with _isolated_root_logger():
         assert _run(fleet_env, "config") == 1
     assert "macOS and Linux" in capsys.readouterr().err
+
+
+# --- ghost --all: the two-machine workflow ---
+
+def test_ghost_is_current_compares_the_full_identity():
+    catalog = _catalog(_entry("a.txt"))
+    marker = mod.ghost_identity(catalog)
+    assert mod.ghost_is_current(marker, catalog) is True
+    for key, wrong in (
+        ("scanned_at", "2020-01-01 00:00:00"),
+        ("label", "Other"),
+        ("entries", "999"),
+        ("bytes", "1"),
+    ):
+        assert mod.ghost_is_current({**marker, key: wrong}, catalog) is False
+    assert mod.ghost_is_current({}, catalog) is False
+
+
+def test_ghost_identity_separates_two_scans_inside_one_second():
+    """scanned_at has one-second resolution: content must break the tie."""
+    stamp = "2026-01-01 12:00:00"
+    before = _catalog(_entry("a.txt", size=10), scanned_at=stamp)
+    after = _catalog(_entry("a.txt", size=10), _entry("b.txt", size=10),
+                     scanned_at=stamp)
+    assert mod.ghost_is_current(mod.ghost_identity(before), after) is False
+
+
+def test_read_ghost_marker_of_a_missing_or_broken_ghost_is_empty(tmp_path):
+    assert mod.read_ghost_marker(tmp_path / "nope") == {}
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / mod.GHOST_MARKER).write_text("{not json")
+    assert mod.read_ghost_marker(broken) == {}
+
+
+def test_ghost_all_rebuilds_every_catalogue_in_the_fleet(fleet_env, capsys):
+    """Catalogues travel between machines; ghosts are rebuilt where they land."""
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    _scan(fleet_env, "Backup2", "Enclosure2", "-q")
+    shutil.rmtree(fleet_env.ghosts, ignore_errors=True)
+    capsys.readouterr()
+    code = _run(fleet_env, "ghost", "--all", "--ghost-root", str(fleet_env.ghosts))
+    assert code == 0
+    assert (fleet_env.ghosts / "Backup1/Photos/a.jpg").is_file()
+    assert (fleet_env.ghosts / "Backup2").is_dir()
+    assert "2 rebuilt, 0 already current, 0 failed" in capsys.readouterr().out
+
+
+def test_ghost_all_skips_the_ghosts_already_current(fleet_env, capsys):
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    _run(fleet_env, "ghost", "--all", "--ghost-root", str(fleet_env.ghosts), "-q")
+    capsys.readouterr()
+    _run(fleet_env, "ghost", "--all", "--ghost-root", str(fleet_env.ghosts))
+    assert "0 rebuilt, 1 already current" in capsys.readouterr().out
+
+
+def test_ghost_all_force_rebuilds_anyway(fleet_env, capsys):
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    _run(fleet_env, "ghost", "--all", "--ghost-root", str(fleet_env.ghosts), "-q")
+    capsys.readouterr()
+    _run(fleet_env, "ghost", "--all", "--force", "--ghost-root", str(fleet_env.ghosts))
+    assert "1 rebuilt, 0 already current" in capsys.readouterr().out
+
+
+def test_ghost_all_rebuilds_after_a_rescan(fleet_env, capsys):
+    """A newer catalogue must win over a stale ghost."""
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    _run(fleet_env, "ghost", "--all", "--ghost-root", str(fleet_env.ghosts), "-q")
+    (fleet_env.volumes / "Backup1" / "Photos" / "new.jpg").write_text("x" * 50)
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    capsys.readouterr()
+    _run(fleet_env, "ghost", "--all", "--ghost-root", str(fleet_env.ghosts))
+    assert "1 rebuilt" in capsys.readouterr().out
+    assert (fleet_env.ghosts / "Backup1/Photos/new.jpg").is_file()
+
+
+def test_ghost_all_survives_one_broken_catalogue(fleet_env, capsys):
+    """One unreadable catalogue must not stop the rest of the fleet."""
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    broken = fleet_env.base / "catalogs/Enclosure1/Broken.json.gz"
+    broken.write_bytes(b"not a catalogue")
+    capsys.readouterr()
+    with _isolated_root_logger():
+        code = _run(fleet_env, "ghost", "--all", "--ghost-root", str(fleet_env.ghosts))
+    out = capsys.readouterr()
+    assert code == 1
+    assert "1 rebuilt" in out.out and "1 failed" in out.out
+    assert "FAILED: Broken.json.gz" in out.out
+    assert (fleet_env.ghosts / "Backup1").is_dir()  # the healthy one still built
+
+
+def test_ghost_all_rejects_a_catalogue_argument(fleet_env, capsys):
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    catalogue = fleet_env.base / "catalogs/Enclosure1/Backup1.json.gz"
+    with _isolated_root_logger():
+        assert _run(fleet_env, "ghost", "--all", str(catalogue)) == 1
+    assert "pass no catalogue" in capsys.readouterr().err
+
+
+def test_ghost_without_a_catalogue_says_what_to_do(fleet_env, capsys):
+    with _isolated_root_logger():
+        assert _run(fleet_env, "ghost") == 1
+    assert "--all" in capsys.readouterr().err
+
+
+def test_ghost_all_on_an_empty_fleet_explains_itself(fleet_env, capsys):
+    with _isolated_root_logger():
+        assert _run(fleet_env, "ghost", "--all") == 1
+    assert "shelf scan" in capsys.readouterr().err
