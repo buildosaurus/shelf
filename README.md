@@ -41,6 +41,17 @@ $ du -sh ~/Volumes/Backup1          # 46,036 files, declaring 1,060 GB
 108K
 ```
 
+### The whole thing on one page
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/how-shelf-works-dark.svg">
+  <img alt="How shelf works: scanning the plugged-in disk /Volumes/Backup1 writes a 1.3 MiB catalogue at catalogs/Enclosure1/Backup1.json.gz that syncs between machines; that catalogue unzips into RAM in 0.05 s, after which shelf find searches it in 0.02 s with no ghost and no disk plugged in, while shelf ghost --all rebuilds it locally as a sparse tree at ~/Volumes/Backup1 that ls, grep, Finder and Spotlight browse natively." src="docs/how-shelf-works.svg" width="100%">
+</picture>
+
+You plug a disk in once. Everything after that reads the catalogue — which is
+small enough to sync, so every machine can rebuild every ghost without ever
+seeing the disk.
+
 ### Where other tools fit
 
 Honest comparison — each of these wins somewhere:
