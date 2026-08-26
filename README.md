@@ -210,6 +210,7 @@ itself in `shelf.toml`.
 |---|---|
 | `--exclude PATTERN` | Ignore a pattern, repeatable (name, or path if it contains `/`) |
 | `--no-default-excludes` | Keep `.DS_Store`, `._*`, `.Spotlight-V100`, `@eaDir`… |
+| `--no-config-excludes` | Ignore the `[excludes]` section of `shelf.toml` |
 | `--follow-symlinks` | Follow symlinks instead of recording them |
 | `--allow-empty` | Overwrite a stocked inventory with an empty catalogue |
 | `--mount-root`, `--ghost-root` | Override this platform's paths |
@@ -227,6 +228,7 @@ you which disk each hit lives on.
 | `shelf du CATALOGUE [PATH]` | What weighs the most (`--depth`, `--top`) |
 | `shelf tree CATALOGUE [PATH]` | Draw the tree (`--depth`) |
 | `shelf ghost --all` | Rebuild every ghost from the local catalogues |
+| `--no-excludes` | On any of the above: show what `[excludes]` is hiding |
 
 Filters: `--name`, `--path`, `--under`, `--type f|d`, `--min-size`,
 `--max-size`, `--newer`, `--older`, `--enclosure`, `--case-sensitive`. Sizes as
@@ -318,6 +320,12 @@ deskside = ["Enclosure1", "Enclosure2"]
 
 [labels]
 "Photo Drive" = "Photos 2024"
+
+[excludes]
+global = ["node_modules", "*.tmp"]
+
+[excludes.catalogue]
+Backup1 = ["Photos/RAW", "VMs"]
 ```
 
 The platform this machine runs is filled in; the other stays commented, so one
@@ -325,6 +333,43 @@ file documents both without imposing either. Precedence is **CLI flag > config
 > built-in default**. `[labels]` is only needed when a label differs from the
 volume name. A volume belongs to exactly one enclosure — redeclaring it
 elsewhere moves it.
+
+### Excluding folders
+
+`--exclude` on the command line is a one-off. `[excludes]` is the standing rule:
+`global` applies to the whole fleet, `[excludes.catalogue]` adds to it for one
+disk, keyed by **label** — the name the catalogue is filed under. A pattern
+containing a `/` matches the path from the root of the disk, otherwise the name
+alone. Matching ignores case and accents, like `shelf find`.
+
+The three sources **add up** rather than override, because an exclude list is a
+set and the useful gesture is "also skip this one":
+
+```
+built-ins  +  [excludes].global  +  [excludes.catalogue].<label>  +  --exclude
+```
+
+Each half opts out on its own — `--no-default-excludes` drops the built-ins,
+`--no-config-excludes` drops the config.
+
+A rule applies **at once, to catalogues written before it**. That is the point:
+you add a line and the folder disappears from `ls`, `find`, `du`, `tree` and any
+ghost you rebuild, with the disk still in its drawer. Nothing is destroyed — the
+entries are hidden, not deleted, and `--no-excludes` shows them again:
+
+```console
+$ shelf find --name '*.js'
+WARNING: 6 entry(ies) hidden by [excludes] in shelf.toml - --no-excludes shows them
+```
+
+The next `scan` is what makes it permanent: from then on those entries are never
+written, and `shelf info` says so under `Not scanned` — so a folder that was
+skipped stays distinguishable from one that was never there.
+
+> **Editing `shelf.toml` by hand:** `shelf` rewrites the whole file whenever the
+> fleet changes, so your `[excludes]` lists survive but **comments around them do
+> not**. A label containing a dot needs quoting — `"My.Disk" = [...]` — or TOML
+> reads it as a nested table and silently ignores it.
 
 ---
 
@@ -439,10 +484,10 @@ path under that name, and `--cov=shelf` silently collects nothing.
 ```console
 $ uv run --with pytest --with pytest-cov pytest test_shelf.py \
     --cov=script_under_test --cov-report=term-missing
-shelf.py    1135    69    94%
+shelf.py    1228    67    95%
 ```
 
-**223 tests, 94% coverage.** The uncovered lines are mostly OS error branches
+**259 tests, 95% coverage.** The uncovered lines are mostly OS error branches
 that would need a broken filesystem to reach; they are not padded to chase a
 round number.
 

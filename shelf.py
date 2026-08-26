@@ -22,6 +22,7 @@ import plistlib
 import shlex
 import shutil
 import signal
+import functools
 import subprocess
 import sys
 import tempfile
@@ -141,6 +142,7 @@ class Catalog:
     shelf_version: str = ""
     platform: str = ""
     filesystem: str = ""
+    excludes: list[str] = field(default_factory=list)
 
     @property
     def display(self) -> str:
@@ -173,11 +175,30 @@ def norm_key(rel: str, *, case_insensitive: bool = True) -> str:
     return key.casefold() if case_insensitive else key
 
 
+@functools.lru_cache(maxsize=64)
+def norm_patterns(patterns: tuple[str, ...]) -> tuple[str, ...]:
+    """Normalise a pattern set once per walk, not once per file.
+
+    scan_tree calls is_excluded on every entry; folding twenty patterns 46,000
+    times is work for nothing. Cached on the tuple, which is the same object
+    for the whole walk. Normalising inside rather than asking callers to do it
+    keeps the raw DEFAULT_EXCLUDES safe to pass straight in.
+    """
+    return tuple(norm_key(p) for p in patterns)
+
+
 def is_excluded(rel: str, name: str, patterns: tuple[str, ...]) -> bool:
-    """A pattern containing a "/" is matched on the path, else on the name."""
+    """A pattern containing a "/" is matched on the path, else on the name.
+
+    Compared through norm_key, like every other match in shelf: APFS is
+    case-insensitive by default, so a pattern typed "Photos/RAW" into the config
+    must still catch "Photos/raw". Both sides are normalised - fnmatch would
+    otherwise compare a decomposed name against a precomposed pattern.
+    """
+    rel_key, name_key = norm_key(rel), norm_key(name)
     return any(
-        fnmatch.fnmatch(rel if "/" in pattern else name, pattern)
-        for pattern in patterns
+        fnmatch.fnmatchcase(rel_key if "/" in pattern else name_key, pattern)
+        for pattern in norm_patterns(patterns)
     )
 
 
@@ -211,6 +232,39 @@ def parent_key(key: str) -> str:
 def ancestors(key: str) -> list[str]:
     parts = key.split("/")
     return [""] + ["/".join(parts[:i]) for i in range(1, len(parts))]
+
+
+def filter_entries(
+    entries: dict[str, Entry], patterns: tuple[str, ...]
+) -> dict[str, Entry]:
+    """Apply excludes to an already-built catalogue.
+
+    `scan_tree` prunes: an excluded directory is never descended into. A
+    catalogue has no tree to prune - it is a flat dict - so excluding "VMs"
+    would drop the directory and leave "VMs/disk.img" behind, whose basename
+    matches nothing.
+
+    Sorted keys put a directory immediately before its whole subtree, so one
+    string prefix skips the lot - and skips testing every pattern against every
+    buried file, which is the point on the folders big enough to be worth
+    excluding. Keys are already norm_key-ed, so matching here is normalised for
+    free.
+    """
+    if not patterns:
+        return entries
+    kept: dict[str, Entry] = {}
+    pruned = ""
+    for key in sorted(entries):
+        if pruned and key.startswith(pruned):
+            continue
+        pruned = ""
+        entry = entries[key]
+        if is_excluded(key, key.rsplit("/", 1)[-1], patterns):
+            if entry.is_dir:
+                pruned = f"{key}/"
+            continue
+        kept[key] = entry
+    return kept
 
 
 def index_children(entries: dict[str, Entry]) -> dict[str, list[str]]:
@@ -343,6 +397,8 @@ class Fleet:
     groups: dict[str, list[str]] = field(default_factory=dict)
     labels: dict[str, str] = field(default_factory=dict)
     platforms: dict[str, dict[str, str]] = field(default_factory=dict)
+    global_excludes: list[str] = field(default_factory=list)
+    catalogue_excludes: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _as_str_list(value: object) -> list[str]:
@@ -357,6 +413,7 @@ def parse_fleet(raw: dict[str, object]) -> Fleet:
     """Build a Fleet from already-parsed TOML. Forgiving: a missing or
     mistyped section yields an empty dict, never an exception — a hand-edited
     file must not break every command."""
+    excludes = _as_table(raw.get("excludes"))
     return Fleet(
         enclosures={
             name: _as_str_list(v)
@@ -372,6 +429,11 @@ def parse_fleet(raw: dict[str, object]) -> Fleet:
             name: {k: str(v) for k, v in _as_table(section).items()}
             for name, section in _as_table(raw.get("platform")).items()
             if name in PLATFORMS
+        },
+        global_excludes=_as_str_list(excludes.get("global")),
+        catalogue_excludes={
+            label: _as_str_list(patterns)
+            for label, patterns in _as_table(excludes.get("catalogue")).items()
         },
     )
 
@@ -417,6 +479,17 @@ def dump_fleet(fleet: Fleet) -> str:
     lines += ["", "[labels]"]
     for volume in sorted(fleet.labels):
         lines.append(f"{_toml_key(volume)} = {_toml_str(fleet.labels[volume])}")
+    # Skipped when scanning AND hidden from ls/find/du/tree, so a rule added
+    # here bites at once, with the disk still in its drawer. A pattern holding
+    # a "/" matches the path from the root of the disk, else the name alone.
+    lines += ["", "[excludes]"]
+    patterns = ", ".join(_toml_str(p) for p in fleet.global_excludes)
+    lines.append(f"global = [{patterns}]")
+    # Keyed by label - the name the catalogue is filed under, not the volume.
+    lines += ["", "[excludes.catalogue]"]
+    for label in sorted(fleet.catalogue_excludes):
+        patterns = ", ".join(_toml_str(p) for p in fleet.catalogue_excludes[label])
+        lines.append(f"{_toml_key(label)} = [{patterns}]")
     return "\n".join(lines) + "\n"
 
 
@@ -779,6 +852,14 @@ def render_info(catalog: Catalog) -> str:
         if catalog.shelf_version:
             stamp += f", shelf {catalog.shelf_version}"
         lines.append(f"Scanned by  : {stamp}")
+    if catalog.excludes:
+        # The built-ins are noise - what matters is what YOU asked to skip.
+        chosen = [p for p in catalog.excludes if p not in DEFAULT_EXCLUDES]
+        builtins = len(catalog.excludes) - len(chosen)
+        summary = ", ".join(chosen) or "(built-ins only)"
+        if builtins:
+            summary += f" (+{human_int(builtins)} built-ins)"
+        lines.append(f"Not scanned : {summary}")
     if catalog.errors:
         lines.append(f"Errors      : {human_int(len(catalog.errors))} (see --json)")
     if catalog.collisions:
@@ -885,6 +966,7 @@ def read_catalog(path: Path) -> Catalog:
             shelf_version=str(raw.get("shelf_version", "")),
             platform=str(raw.get("platform", "")),
             filesystem=str(raw.get("filesystem", "")),
+            excludes=_as_str_list(raw.get("excludes")),
         )
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise CatalogError(f"unreadable catalogue {path}: {exc}") from exc
@@ -907,6 +989,7 @@ def write_catalog(path: Path, catalog: Catalog) -> None:
         "entries": {k: asdict(v) for k, v in catalog.entries.items()},
         "errors": catalog.errors,
         "collisions": catalog.collisions,
+        "excludes": catalog.excludes,
     }
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1204,6 +1287,7 @@ class Context:
 
     base: Path
     platform: Platform
+    fleet: Fleet = field(default_factory=Fleet)
 
     @property
     def config_path(self) -> Path:
@@ -1237,7 +1321,7 @@ def build_context(args: argparse.Namespace) -> Context:
             shortcut_suffix=plat.shortcut_suffix,
             excluder=plat.excluder,
         )
-    return Context(base=base, platform=plat)
+    return Context(base=base, platform=plat, fleet=fleet)
 
 
 def ensure_ghost_root(platform: Platform) -> Path:
@@ -1304,6 +1388,7 @@ def _scan_one(
         shelf_version=__version__,
         platform=platform_label(),
         filesystem=detect_filesystem(root),
+        excludes=list(excludes),
     )
 
 
@@ -1351,9 +1436,27 @@ def _make_ghost(catalog: Catalog, ghost_root: Path, *, empty: bool = False) -> P
     return dest
 
 
-def _excludes_from(args: argparse.Namespace) -> tuple[str, ...]:
+def config_excludes(fleet: Fleet, label: str) -> tuple[str, ...]:
+    """What shelf.toml says to skip for one catalogue: global, then its own."""
+    return tuple(
+        dict.fromkeys(
+            [*fleet.global_excludes, *fleet.catalogue_excludes.get(label, [])]
+        )
+    )
+
+
+def _excludes_from(
+    args: argparse.Namespace, fleet: Fleet, label: str
+) -> tuple[str, ...]:
+    """Built-ins, config and CLI are additive; each half opts out on its own.
+
+    A set, not a scalar: "also skip this one" is the useful gesture, so --exclude
+    adds to the config rather than replacing it the way --mount-root replaces a
+    path. Order is irrelevant - is_excluded is an any() - so dedup is free.
+    """
     defaults = () if args.no_default_excludes else DEFAULT_EXCLUDES
-    return tuple(args.exclude) + defaults
+    config = () if args.no_config_excludes else config_excludes(fleet, label)
+    return tuple(dict.fromkeys([*defaults, *config, *args.exclude]))
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
@@ -1366,7 +1469,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         root,
         label=label,
         enclosure=enclosure,
-        excludes=_excludes_from(args),
+        excludes=_excludes_from(args, ctx.fleet, label),
         follow_symlinks=args.follow_symlinks,
         allow_empty=args.allow_empty,
     )
@@ -1441,7 +1544,7 @@ def cmd_save(args: argparse.Namespace) -> int:
                 ctx.platform.mount_root / volume,
                 label=label,
                 enclosure=enclosure,
-                excludes=_excludes_from(args),
+                excludes=_excludes_from(args, fleet, label),
                 follow_symlinks=args.follow_symlinks,
                 allow_empty=args.allow_empty,
             )
@@ -1597,6 +1700,70 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def filter_catalog(catalog: Catalog, patterns: tuple[str, ...]) -> Catalog:
+    """The catalogue as [excludes] says it should be seen."""
+    return replace(catalog, entries=filter_entries(catalog.entries, patterns))
+
+
+def _view_fleet(args: argparse.Namespace) -> Fleet:
+    """The config, for read commands that never build a full Context.
+
+    A config that will not parse must not stop you browsing an unplugged disk:
+    the catalogues are the data, shelf.toml is only a lens over them.
+    """
+    if getattr(args, "no_excludes", False):
+        return Fleet()
+    try:
+        return read_fleet(resolve_base(args.base) / CONFIG_NAME)
+    except CatalogError as exc:
+        log.warning("%s - browsing without [excludes]", exc)
+        return Fleet()
+
+
+def _view(
+    catalog: Catalog, fleet: Fleet, args: argparse.Namespace
+) -> tuple[Catalog, int]:
+    """Hide what [excludes] hides, and count what was hidden.
+
+    A rule added to the config applies to catalogues written before it, which is
+    the point - no re-scan, no disk. The count is what keeps that honest.
+    """
+    if getattr(args, "no_excludes", False):
+        return catalog, 0
+    patterns = config_excludes(fleet, catalog.label)
+    if not patterns:
+        return catalog, 0
+    shown = filter_catalog(catalog, patterns)
+    return shown, len(catalog.entries) - len(shown.entries)
+
+
+def _warn_hidden(hidden: int) -> None:
+    """Say so on stderr: a filtered listing must never look exhaustive."""
+    if hidden:
+        log.warning(
+            "%s entry(ies) hidden by [excludes] in %s - --no-excludes shows them",
+            human_int(hidden), CONFIG_NAME,
+        )
+
+
+def _start_key(args: argparse.Namespace, shown: Catalog, whole: Catalog) -> str:
+    """Resolve the starting path, telling "excluded" from "absent" apart.
+
+    Looked up in the unfiltered catalogue on failure: "path not in the
+    catalogue" would be a lie for a folder the config is hiding, and would send
+    the reader looking for a disk problem that does not exist.
+    """
+    start = norm_key(args.path.strip("/")) if args.path else ""
+    if start and start not in shown.entries:
+        if start in whole.entries:
+            raise QueryError(
+                f"{args.path} is hidden by [excludes] in {CONFIG_NAME} "
+                "(--no-excludes to see it)"
+            )
+        raise QueryError(f"path not in the catalogue: {args.path}")
+    return start
+
+
 def _catalog_paths(args: argparse.Namespace) -> list[Path]:
     """The catalogues to read: those given as arguments, else the whole fleet."""
     if args.catalogue:
@@ -1612,8 +1779,11 @@ def _catalog_paths(args: argparse.Namespace) -> list[Path]:
 
 
 def cmd_info(args: argparse.Namespace) -> int:
+    fleet = _view_fleet(args)
+    total_hidden = 0
     for index, path in enumerate(_catalog_paths(args)):
-        catalog = read_catalog(path)
+        catalog, hidden = _view(read_catalog(path), fleet, args)
+        total_hidden += hidden
         if args.as_json:
             print(
                 json.dumps(
@@ -1632,6 +1802,8 @@ def cmd_info(args: argparse.Namespace) -> int:
                         "bytes": catalog.total_size,
                         "errors": catalog.errors,
                         "collisions": catalog.collisions,
+                        "not_scanned": catalog.excludes,
+                        "hidden": hidden,
                     },
                     ensure_ascii=False,
                 )
@@ -1641,20 +1813,21 @@ def cmd_info(args: argparse.Namespace) -> int:
             print()
         print(f"[{catalog.source}]")
         print(render_info(catalog))
+    _warn_hidden(total_hidden)
     return 0
 
 
 def cmd_ls(args: argparse.Namespace) -> int:
-    catalog = read_catalog(args.catalogue)
+    whole = read_catalog(args.catalogue)
+    catalog, hidden = _view(whole, _view_fleet(args), args)
     children = index_children(catalog.entries)
-    start = norm_key(args.path.strip("/")) if args.path else ""
-    if start and start not in catalog.entries:
-        raise QueryError(f"path not in the catalogue: {args.path}")
+    start = _start_key(args, catalog, whole)
     if start and not catalog.entries[start].is_dir:
         items = [catalog.entries[start]]
     else:
         items = [catalog.entries[k] for k in children.get(start, [])]
     items = sort_entries(items, key=args.sort, reverse=args.reverse)
+    _warn_hidden(hidden)
     if args.as_json:
         print(json.dumps([asdict(e) for e in items], ensure_ascii=False))
         return 0
@@ -1684,17 +1857,21 @@ def cmd_find(args: argparse.Namespace) -> int:
     paths = _catalog_paths(args)
     multi = len(paths) > 1
     found = 0
+    fleet = _view_fleet(args)
+    total_hidden = 0
     payload: list[dict[str, object]] = []
     for path in paths:
-        catalog = read_catalog(path)
+        catalog, hidden = _view(read_catalog(path), fleet, args)
         if args.enclosure and catalog.enclosure != args.enclosure:
             continue
+        total_hidden += hidden
         hits = sort_entries(
             search(catalog.entries, query), key=args.sort, reverse=args.reverse
         )
         for entry in hits:
             if args.limit and found >= args.limit:
                 log.warning("limit of %s result(s) reached", human_int(args.limit))
+                _warn_hidden(total_hidden)
                 return 0
             found += 1
             marque = f"[{catalog.display}] " if multi else ""
@@ -1715,15 +1892,15 @@ def cmd_find(args: argparse.Namespace) -> int:
     log.info("%s result(s)", human_int(found))
     if not found:
         log.warning("no result")
+    _warn_hidden(total_hidden)
     return 0
 
 
 def cmd_du(args: argparse.Namespace) -> int:
-    catalog = read_catalog(args.catalogue)
+    whole = read_catalog(args.catalogue)
+    catalog, hidden = _view(whole, _view_fleet(args), args)
     totals = dir_totals(catalog.entries)
-    start = norm_key(args.path.strip("/")) if args.path else ""
-    if start and start not in catalog.entries:
-        raise QueryError(f"path not in the catalogue: {args.path}")
+    start = _start_key(args, catalog, whole)
     depth = args.depth
     base_depth = start.count("/") + 1 if start else 0
     rows = [
@@ -1735,6 +1912,7 @@ def cmd_du(args: argparse.Namespace) -> int:
         and key.count("/") - base_depth < depth
     ]
     rows.sort(key=lambda row: row[1], reverse=True)
+    _warn_hidden(hidden)
     if args.top:
         rows = rows[: args.top]
     if args.as_json:
@@ -1754,11 +1932,11 @@ def cmd_du(args: argparse.Namespace) -> int:
 
 
 def cmd_tree(args: argparse.Namespace) -> int:
-    catalog = read_catalog(args.catalogue)
+    whole = read_catalog(args.catalogue)
+    catalog, hidden = _view(whole, _view_fleet(args), args)
     children = index_children(catalog.entries)
-    start = norm_key(args.path.strip("/")) if args.path else ""
-    if start and start not in catalog.entries:
-        raise QueryError(f"path not in the catalogue: {args.path}")
+    start = _start_key(args, catalog, whole)
+    _warn_hidden(hidden)
     print(args.path or catalog.root)
     lines = render_tree(
         catalog.entries, children, start=start, depth=args.depth, show_size=args.long
@@ -1786,9 +1964,11 @@ def cmd_ghost_all(args: argparse.Namespace) -> int:
     rebuilt: list[str] = []
     current: list[str] = []
     failed: list[str] = []
+    total_hidden = 0
     for path in paths:
         try:
-            catalog = read_catalog(path)
+            catalog, hidden = _view(read_catalog(path), ctx.fleet, args)
+            total_hidden += hidden
             dest = root / catalog.label
             if not args.force and ghost_is_current(read_ghost_marker(dest), catalog):
                 current.append(catalog.label)
@@ -1804,6 +1984,7 @@ def cmd_ghost_all(args: argparse.Namespace) -> int:
             # One unreadable catalogue must not stop the rest of the fleet.
             failed.append(path.name)
             log.error("%s: %s", path.name, exc)
+    _warn_hidden(total_hidden)
     print(
         f"{human_int(len(rebuilt))} rebuilt, {human_int(len(current))} already "
         f"current, {human_int(len(failed))} failed"
@@ -1826,7 +2007,8 @@ def cmd_ghost(args: argparse.Namespace) -> int:
         raise QueryError(
             "give a catalogue file, or --all to rebuild every ghost in the fleet"
         )
-    catalog = read_catalog(args.catalogue)
+    catalog, hidden = _view(read_catalog(args.catalogue), _view_fleet(args), args)
+    _warn_hidden(hidden)
     if args.destination is not None:
         dest = args.destination.expanduser()
         if dest.exists() and any(dest.iterdir()):
@@ -1937,6 +2119,10 @@ def _add_scan_options(parser: argparse.ArgumentParser) -> None:
         help="Do not ignore macOS/Windows junk (.DS_Store, ._*, ...)",
     )
     group.add_argument(
+        "--no-config-excludes", action="store_true",
+        help=f"Ignore the [excludes] section of {CONFIG_NAME}",
+    )
+    group.add_argument(
         "--follow-symlinks", action="store_true",
         help="Follow symlinks (default: treat them as plain entries)",
     )
@@ -1949,6 +2135,15 @@ def _add_scan_options(parser: argparse.ArgumentParser) -> None:
         "--allow-empty", action="store_true",
         help="Allow writing an empty catalogue; by default a walk that reads "
              "nothing is refused, so an existing inventory is never overwritten",
+    )
+
+
+def _add_view_options(parser: argparse.ArgumentParser) -> None:
+    """Reading options shared by every command that opens a catalogue."""
+    parser.add_argument(
+        "--no-excludes", action="store_true",
+        help=f"Show everything the catalogue holds, ignoring the [excludes] "
+             f"section of {CONFIG_NAME}",
     )
 
 
@@ -2129,6 +2324,7 @@ def build_parser() -> argparse.ArgumentParser:
         "catalogue", type=Path, nargs="*",
         help="Catalogue file(s) (default: the whole fleet under <base>/catalogs/)",
     )
+    _add_view_options(info)
     _add_general(info)
     info.set_defaults(func=cmd_info)
 
@@ -2150,6 +2346,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sort key",
     )
     ls.add_argument("-r", "--reverse", action="store_true", help="Reverse the sort")
+    _add_view_options(ls)
     _add_general(ls)
     ls.set_defaults(func=cmd_ls)
 
@@ -2191,6 +2388,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     display.add_argument("--limit", type=int, default=0, metavar="N",
                            help="Stop after N results (0 = all)")
+    _add_view_options(find)
     _add_general(find)
     find.set_defaults(func=cmd_find)
 
@@ -2205,6 +2403,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Detail depth (default 1)")
     du.add_argument("--top", type=int, default=0, metavar="N",
                     help="Only the N biggest (0 = all)")
+    _add_view_options(du)
     _add_general(du)
     du.set_defaults(func=cmd_du)
 
@@ -2216,6 +2415,7 @@ def build_parser() -> argparse.ArgumentParser:
     tree.add_argument("--depth", type=int, default=3, metavar="N",
                       help="Maximum depth (default 3)")
     tree.add_argument("-l", "--long", action="store_true", help="Show sizes")
+    _add_view_options(tree)
     _add_general(tree)
     tree.set_defaults(func=cmd_tree)
 
@@ -2240,6 +2440,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true",
         help="With --all, rebuild even the ghosts that are already current",
     )
+    _add_view_options(ghost)
     _add_ghost_options(ghost)
     _add_general(ghost)
     ghost.set_defaults(func=cmd_ghost)

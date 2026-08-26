@@ -303,6 +303,145 @@ def test_render_info_lists_the_essentials():
     assert "USB" in text and "/Volumes/Disk" in text and "100 B" in text
 
 
+# --- filter_entries: excludes applied to a flat catalogue ---
+
+def _rels(entries):
+    return {e.rel for e in entries.values()}
+
+
+def test_filter_entries_drops_everything_under_an_excluded_directory():
+    """The catalogue is flat: "VMs/disk.img" does not match the name "VMs"."""
+    entries = _entries(
+        _entry("VMs", is_dir=True),
+        _entry("VMs/disk.img"),
+        _entry("VMs/nested", is_dir=True),
+        _entry("VMs/nested/deep.img"),
+        _entry("keep.txt"),
+    )
+    assert _rels(mod.filter_entries(entries, ("VMs",))) == {"keep.txt"}
+
+
+def test_filter_entries_keeps_a_lookalike_directory():
+    entries = _entries(
+        _entry("VMs", is_dir=True),
+        _entry("VMs/b"),
+        _entry("VMsOther", is_dir=True),
+        _entry("VMsOther/a"),
+    )
+    kept = mod.filter_entries(entries, ("VMs",))
+    assert _rels(kept) == {"VMsOther", "VMsOther/a"}
+
+
+def test_filter_entries_anchors_a_subtree_on_its_directory_entry():
+    """scan_tree records every directory it walks, and that entry is what the
+    descendants hang off. Without it there is nothing to match a bare name
+    against, so the children survive - a catalogue shelf never produces."""
+    orphans = _entries(_entry("VMs/b"))  # no "VMs" entry
+    assert _rels(mod.filter_entries(orphans, ("VMs",))) == {"VMs/b"}
+    assert _rels(mod.filter_entries(orphans, ("VMs/*",))) == set()
+
+
+def test_filter_entries_without_patterns_returns_the_input_untouched():
+    entries = _entries(_entry("a.txt"))
+    assert mod.filter_entries(entries, ()) is entries
+
+
+def test_filter_entries_keeps_everything_when_nothing_matches():
+    entries = _entries(_entry("a.txt"))
+    assert mod.filter_entries(entries, ("nope",)) == entries
+
+
+def test_filter_entries_accepts_a_path_pattern():
+    entries = _entries(
+        _entry("Photos/RAW", is_dir=True),
+        _entry("Photos/RAW/img.dng"),
+        _entry("Photos/img.jpg"),
+    )
+    kept = mod.filter_entries(entries, ("Photos/RAW",))
+    assert _rels(kept) == {"Photos/img.jpg"}
+
+
+# --- Exclude resolution: built-ins + config + CLI, each opt-out-able ---
+
+def _args(exclude=(), no_default=False, no_config=False):
+    return types.SimpleNamespace(
+        exclude=list(exclude),
+        no_default_excludes=no_default,
+        no_config_excludes=no_config,
+    )
+
+
+def _fleet_with_excludes():
+    return mod.Fleet(
+        global_excludes=["node_modules"],
+        catalogue_excludes={"Backup1": ["Photos/RAW"], "Backup2": ["Downloads"]},
+    )
+
+
+def test_config_excludes_adds_the_catalogue_list_to_the_global_one():
+    fleet = _fleet_with_excludes()
+    assert mod.config_excludes(fleet, "Backup1") == ("node_modules", "Photos/RAW")
+    assert mod.config_excludes(fleet, "Unknown") == ("node_modules",)
+
+
+def test_excludes_from_unions_all_four_sources():
+    got = mod._excludes_from(_args(["mine"]), _fleet_with_excludes(), "Backup1")
+    assert "mine" in got and "node_modules" in got and "Photos/RAW" in got
+    assert ".DS_Store" in got  # the built-ins are still there
+
+
+def test_excludes_from_drops_the_built_ins_on_demand():
+    got = mod._excludes_from(_args(no_default=True), _fleet_with_excludes(), "Backup1")
+    assert ".DS_Store" not in got
+    assert "node_modules" in got  # the config half is untouched
+
+
+def test_excludes_from_drops_the_config_on_demand():
+    got = mod._excludes_from(
+        _args(["mine"], no_config=True), _fleet_with_excludes(), "Backup1"
+    )
+    assert "node_modules" not in got and "Photos/RAW" not in got
+    assert "mine" in got and ".DS_Store" in got
+
+
+def test_excludes_from_does_not_repeat_a_pattern_declared_twice():
+    fleet = mod.Fleet(global_excludes=["dup"], catalogue_excludes={"D": ["dup"]})
+    got = mod._excludes_from(_args(["dup"]), fleet, "D")
+    assert got.count("dup") == 1
+
+
+# --- is_excluded: name vs path, normalised like every other match ---
+
+def test_is_excluded_without_a_slash_matches_the_basename():
+    assert mod.is_excluded("a/b/cache", "cache", ("cache",)) is True
+    assert mod.is_excluded("a/b/cache", "cache", ("b",)) is False
+
+
+def test_is_excluded_with_a_slash_matches_the_whole_path():
+    assert mod.is_excluded("Photos/RAW", "RAW", ("Photos/RAW",)) is True
+    # Anchored at the root: the same name deeper down is a different path.
+    assert mod.is_excluded("a/Photos/RAW", "RAW", ("Photos/RAW",)) is False
+
+
+def test_is_excluded_ignores_case():
+    """APFS is case-insensitive: a pattern typed by hand must still catch."""
+    assert mod.is_excluded("Photos/raw", "raw", ("Photos/RAW",)) is True
+    assert mod.is_excluded(".ds_store", ".ds_store", (".DS_Store",)) is True
+
+
+def test_is_excluded_unifies_nfd_and_nfc():
+    """A pattern typed in NFC must catch a name APFS stored decomposed."""
+    nfd = unicodedata.normalize("NFD", "Été")
+    nfc = unicodedata.normalize("NFC", "Été")
+    assert nfd != nfc  # otherwise the test proves nothing
+    assert mod.is_excluded(nfd, nfd, (nfc,)) is True
+    assert mod.is_excluded(nfc, nfc, (nfd,)) is True
+
+
+def test_is_excluded_without_patterns_keeps_everything():
+    assert mod.is_excluded("a", "a", ()) is False
+
+
 # --- scan_tree: the filesystem boundary ---
 
 def test_scan_tree_indexes_relative_paths(tmp_path):
@@ -384,6 +523,30 @@ def test_catalog_is_readable_as_a_mirror_diff_snapshot(tmp_path):
     assert set(raw) >= {"root", "entries", "errors", "collisions"}
     first = next(iter(raw["entries"].values()))
     assert set(first) == {"rel", "is_dir", "size", "mtime"}
+
+
+def test_catalog_records_what_was_skipped_when_it_was_built(tmp_path):
+    """"No node_modules on this disk" and "node_modules was skipped" are not
+    the same fact, and only the catalogue can tell them apart."""
+    root = _tree(tmp_path / "d", {"keep.txt": "x", "junk": None, "junk/a": "y"})
+    path = tmp_path / "c.json.gz"
+    assert mod.main(["scan", str(root), "-o", str(path), "--exclude", "junk",
+                     "-q"]) == 0
+    catalog = mod.read_catalog(path)
+    assert "junk" in catalog.excludes
+    assert "Not scanned" in mod.render_info(catalog)
+
+
+def test_read_catalog_of_an_older_file_without_excludes(tmp_path):
+    """Catalogues written before the field existed must still load."""
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps({
+        "root": "/Volumes/Old", "label": "Old", "scanned_at": "2020-01-01 00:00:00",
+        "entries": {},
+    }))
+    catalog = mod.read_catalog(path)
+    assert catalog.excludes == []
+    assert "Not scanned" not in mod.render_info(catalog)
 
 
 # --- ghost: a tree the system's own tools can walk ---
@@ -480,6 +643,54 @@ def test_parse_fleet_tolerates_a_hand_edited_file(raw):
     fleet = mod.parse_fleet(raw)
     assert isinstance(fleet.enclosures, dict)
     assert all(isinstance(v, list) for v in fleet.enclosures.values())
+
+
+def test_parse_fleet_reads_both_levels_of_excludes():
+    fleet = mod.parse_fleet({
+        "excludes": {
+            "global": ["node_modules", "*.tmp"],
+            "catalogue": {"Backup1": ["Photos/RAW"], "Backup2": ["Downloads"]},
+        }
+    })
+    assert fleet.global_excludes == ["node_modules", "*.tmp"]
+    assert fleet.catalogue_excludes == {
+        "Backup1": ["Photos/RAW"], "Backup2": ["Downloads"]
+    }
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"excludes": "not a table"},
+        {"excludes": {"global": "not a list"}},
+        {"excludes": {"catalogue": "not a table"}},
+        {"excludes": {"catalogue": {"Backup1": "not a list"}}},
+    ],
+)
+def test_parse_fleet_tolerates_a_mistyped_excludes_section(raw):
+    """Same contract as the rest of the file: a typo degrades, never raises."""
+    fleet = mod.parse_fleet(raw)
+    assert fleet.global_excludes == []
+    assert all(isinstance(v, list) for v in fleet.catalogue_excludes.values())
+
+
+def test_excludes_survive_a_config_rewrite(fleet_env):
+    """dump_fleet rebuilds the whole file from the Fleet: a section it does not
+    model is erased by the next mutating command. This is that regression."""
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    config = fleet_env.config
+    config.write_text(
+        config.read_text()
+        .replace("global = []", 'global = ["node_modules"]')
+        .replace(
+            "[excludes.catalogue]",
+            '[excludes.catalogue]\n"Photo Drive" = ["RAW"]',
+        )
+    )
+    assert _run(fleet_env, "enclosure", "add", "Enclosure2", "Backup2", "-q") == 0
+    fleet = mod.read_fleet(config)
+    assert fleet.global_excludes == ["node_modules"]
+    assert fleet.catalogue_excludes == {"Photo Drive": ["RAW"]}
 
 
 def test_fleet_round_trips_through_toml(tmp_path):
@@ -1684,6 +1895,178 @@ def test_main_refuses_an_unsupported_platform(fleet_env, monkeypatch, capsys):
     with _isolated_root_logger():
         assert _run(fleet_env, "config") == 1
     assert "macOS and Linux" in capsys.readouterr().err
+
+
+# --- Excludes end to end: declared once, honoured by scan ---
+
+def _write_excludes(fleet_env, *, glob=(), per_catalogue=None):
+    """Hand-edit the [excludes] section the way a user would."""
+    config = fleet_env.config
+    text = config.read_text()
+    patterns = ", ".join(f'"{p}"' for p in glob)
+    text = text.replace("global = []", f"global = [{patterns}]")
+    for label, rules in (per_catalogue or {}).items():
+        joined = ", ".join(f'"{r}"' for r in rules)
+        text = text.replace(
+            "[excludes.catalogue]", f'[excludes.catalogue]\n"{label}" = [{joined}]'
+        )
+    config.write_text(text)
+
+
+def test_scan_honours_a_global_exclude_from_the_config(fleet_env):
+    (fleet_env.volumes / "Backup1" / "node_modules").mkdir()
+    (fleet_env.volumes / "Backup1" / "node_modules" / "x.js").write_text("x")
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    _write_excludes(fleet_env, glob=["node_modules"])
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    catalog = mod.read_catalog(
+        fleet_env.base / "catalogs/Enclosure1/Backup1.json.gz"
+    )
+    assert not any("node_modules" in e.rel for e in catalog.entries.values())
+    assert any(e.rel == "Photos/a.jpg" for e in catalog.entries.values())
+
+
+def test_scan_honours_a_per_catalogue_exclude(fleet_env):
+    """Backup1's rule must not reach into Backup2."""
+    for volume in ("Backup1", "Backup2"):
+        (fleet_env.volumes / volume / "Secret").mkdir()
+        (fleet_env.volumes / volume / "Secret" / "k.txt").write_text("k")
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    _scan(fleet_env, "Backup2", "Enclosure1", "-q")
+    _write_excludes(fleet_env, per_catalogue={"Backup1": ["Secret"]})
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    _scan(fleet_env, "Backup2", "Enclosure1", "-q")
+    first = mod.read_catalog(fleet_env.base / "catalogs/Enclosure1/Backup1.json.gz")
+    second = mod.read_catalog(fleet_env.base / "catalogs/Enclosure1/Backup2.json.gz")
+    assert not any("Secret" in e.rel for e in first.entries.values())
+    assert any("Secret" in e.rel for e in second.entries.values())
+
+
+def test_scan_no_config_excludes_ignores_the_declared_rules(fleet_env):
+    (fleet_env.volumes / "Backup1" / "node_modules").mkdir()
+    (fleet_env.volumes / "Backup1" / "node_modules" / "x.js").write_text("x")
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    _write_excludes(fleet_env, glob=["node_modules"])
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q", "--no-config-excludes")
+    catalog = mod.read_catalog(
+        fleet_env.base / "catalogs/Enclosure1/Backup1.json.gz"
+    )
+    assert any("node_modules" in e.rel for e in catalog.entries.values())
+
+
+# --- Excludes at read time: the rule bites without a re-scan ---
+def test_an_exclude_rule_cannot_empty_a_stocked_catalogue(fleet_env, capsys):
+    """_guard_overwrite reads the PREVIOUS catalogue unfiltered. Filter it too
+    and a disk hidden entirely by a rule looks empty, the guard stands down,
+    and the only copy is overwritten - the exact loss it exists to prevent."""
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    catalogue = fleet_env.base / "catalogs/Enclosure1/Backup1.json.gz"
+    before = catalogue.read_bytes()
+    _write_excludes(fleet_env, glob=["*"])
+    capsys.readouterr()
+    with _isolated_root_logger():
+        assert _scan(fleet_env, "Backup1", "Enclosure1") == 1
+    assert catalogue.read_bytes() == before
+
+
+
+def _backup1_with_junk(fleet_env):
+    """A catalogue written BEFORE any exclude rule exists."""
+    (fleet_env.volumes / "Backup1" / "node_modules").mkdir()
+    (fleet_env.volumes / "Backup1" / "node_modules" / "x.js").write_text("x" * 40)
+    _scan(fleet_env, "Backup1", "Enclosure1", "-q")
+    return fleet_env.base / "catalogs/Enclosure1/Backup1.json.gz"
+
+
+def test_find_hides_entries_a_rescan_would_have_kept(fleet_env, capsys):
+    """The whole point: the rule applies to a catalogue written before it."""
+    _backup1_with_junk(fleet_env)
+    _write_excludes(fleet_env, glob=["node_modules"])
+    capsys.readouterr()
+    with _isolated_root_logger():
+        assert _run(fleet_env, "find", "--name", "*.js") == 0
+    out = capsys.readouterr()
+    assert "x.js" not in out.out
+    assert "hidden by [excludes]" in out.err  # never looks exhaustive
+
+
+def test_find_no_excludes_brings_them_back(fleet_env, capsys):
+    _backup1_with_junk(fleet_env)
+    _write_excludes(fleet_env, glob=["node_modules"])
+    capsys.readouterr()
+    with _isolated_root_logger():
+        assert _run(fleet_env, "find", "--name", "*.js", "--no-excludes") == 0
+    out = capsys.readouterr()
+    assert "x.js" in out.out
+    assert "hidden by [excludes]" not in out.err
+
+
+def test_ls_of_an_excluded_path_says_it_is_hidden_not_absent(fleet_env, capsys):
+    """"path not in the catalogue" would send the reader hunting a disk fault."""
+    catalogue = _backup1_with_junk(fleet_env)
+    _write_excludes(fleet_env, glob=["node_modules"])
+    capsys.readouterr()
+    with _isolated_root_logger():
+        assert _run(fleet_env, "ls", str(catalogue), "node_modules") == 1
+    assert "hidden by [excludes]" in capsys.readouterr().err
+
+
+def test_ls_of_a_genuinely_absent_path_still_says_so(fleet_env, capsys):
+    catalogue = _backup1_with_junk(fleet_env)
+    _write_excludes(fleet_env, glob=["node_modules"])
+    capsys.readouterr()
+    with _isolated_root_logger():
+        assert _run(fleet_env, "ls", str(catalogue), "nowhere") == 1
+    assert "path not in the catalogue" in capsys.readouterr().err
+
+
+def test_du_totals_drop_the_hidden_bytes(fleet_env, capsys):
+    catalogue = _backup1_with_junk(fleet_env)
+    capsys.readouterr()
+    _run(fleet_env, "du", str(catalogue), "-q")
+    before = capsys.readouterr().out
+    _write_excludes(fleet_env, glob=["node_modules"])
+    _run(fleet_env, "du", str(catalogue), "-q")
+    assert "node_modules" in before
+    assert "node_modules" not in capsys.readouterr().out
+
+
+def test_a_broken_config_does_not_stop_you_browsing(fleet_env, capsys):
+    """The catalogues are the data; shelf.toml is only a lens over them."""
+    catalogue = _backup1_with_junk(fleet_env)
+    fleet_env.config.write_text("this is not : toml [[[")
+    capsys.readouterr()
+    with _isolated_root_logger():
+        assert _run(fleet_env, "ls", str(catalogue)) == 0
+    out = capsys.readouterr()
+    assert "Photos" in out.out
+    assert "browsing without [excludes]" in out.err
+
+
+def test_an_exclude_rule_makes_ghost_all_rebuild_on_its_own(fleet_env, capsys):
+    """ghost_identity keys on entry count and size, so it must be computed
+    AFTER filtering - otherwise the fleet looks stale on every single run."""
+    _backup1_with_junk(fleet_env)
+    _run(fleet_env, "ghost", "--all", "--ghost-root", str(fleet_env.ghosts), "-q")
+    capsys.readouterr()
+    _run(fleet_env, "ghost", "--all", "--ghost-root", str(fleet_env.ghosts))
+    assert "0 rebuilt, 1 already current" in capsys.readouterr().out
+    _write_excludes(fleet_env, glob=["node_modules"])
+    with _isolated_root_logger():
+        _run(fleet_env, "ghost", "--all", "--ghost-root", str(fleet_env.ghosts))
+    assert "1 rebuilt" in capsys.readouterr().out
+    assert not (fleet_env.ghosts / "Backup1/node_modules").exists()
+
+
+def test_ghost_all_stays_current_when_no_rule_changed(fleet_env, capsys):
+    """The identity must be stable across runs, not merely recomputed."""
+    _backup1_with_junk(fleet_env)
+    _write_excludes(fleet_env, glob=["node_modules"])
+    _run(fleet_env, "ghost", "--all", "--ghost-root", str(fleet_env.ghosts), "-q")
+    capsys.readouterr()
+    with _isolated_root_logger():
+        _run(fleet_env, "ghost", "--all", "--ghost-root", str(fleet_env.ghosts))
+    assert "0 rebuilt, 1 already current" in capsys.readouterr().out
 
 
 # --- ghost --all: the two-machine workflow ---
