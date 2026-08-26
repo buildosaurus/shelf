@@ -29,7 +29,7 @@ import tomllib
 import unicodedata
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -472,18 +472,17 @@ def register_volume(fleet: Fleet, enclosure: str, volume: str, label: str) -> Fl
         labels.pop(volume, None)
     else:
         labels[volume] = label
-    return Fleet(enclosures, dict(fleet.groups), labels, dict(fleet.platforms))
+    return replace(fleet, enclosures=enclosures, labels=labels)
 
 
 def unregister_volume(fleet: Fleet, volume: str) -> Fleet:
-    return Fleet(
+    return replace(
+        fleet,
         enclosures={
             name: [v for v in volumes if v != volume]
             for name, volumes in fleet.enclosures.items()
         },
-        groups=dict(fleet.groups),
         labels={k: v for k, v in fleet.labels.items() if k != volume},
-        platforms=dict(fleet.platforms),
     )
 
 
@@ -493,18 +492,14 @@ def set_group(fleet: Fleet, name: str, enclosures: list[str]) -> Fleet:
         raise QueryError(f"unknown enclosure(s): {', '.join(unknown)}")
     groups = dict(fleet.groups)
     groups[name] = list(dict.fromkeys(enclosures))
-    return Fleet(
-        dict(fleet.enclosures), groups, dict(fleet.labels), dict(fleet.platforms)
-    )
+    return replace(fleet, groups=groups)
 
 
 def drop_group(fleet: Fleet, name: str) -> Fleet:
     if name not in fleet.groups:
         raise QueryError(f"unknown group: {name}")
     groups = {k: v for k, v in fleet.groups.items() if k != name}
-    return Fleet(
-        dict(fleet.enclosures), groups, dict(fleet.labels), dict(fleet.platforms)
-    )
+    return replace(fleet, groups=groups)
 
 
 def platform_from_system(system: str) -> str:
@@ -1415,9 +1410,7 @@ def _with_platform(fleet: Fleet, platform: Platform) -> Fleet:
     """
     platforms = dict(fleet.platforms)
     platforms[platform.name] = platform_as_config(platform)
-    return Fleet(
-        dict(fleet.enclosures), dict(fleet.groups), dict(fleet.labels), platforms
-    )
+    return replace(fleet, platforms=platforms)
 
 
 def cmd_save(args: argparse.Namespace) -> int:
